@@ -22,7 +22,7 @@ Grab the latest Windows executable from the
 
 ## Screenshot
 
-*(add a screenshot of the GUI here, e.g. `docs/screenshot.png`)*
+
 
 ```markdown
 ![screenshot](docs/screenshot.png)
