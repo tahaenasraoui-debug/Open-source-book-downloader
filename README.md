@@ -24,9 +24,9 @@ Grab the latest Windows executable from the
 
 
 
-```markdown
+
 ![screenshot](docs/screenshot.png)
-```
+
 
 ## Running from source
 
