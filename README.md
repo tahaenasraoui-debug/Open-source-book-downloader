@@ -1,4 +1,7 @@
- Free Book Downloader
+# Free Book Downloader
+
+[![CI](https://github.com/tahaenasraoui-debug/Open-source-book-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/tahaenasraoui-debug/Open-source-book-downloader/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A desktop GUI for finding and downloading books that are genuinely free
 and public domain, pulled from three sources:
@@ -18,15 +21,11 @@ without a licence.
 ## Download
 
 Grab the latest Windows executable from the
-[Releases page](../../releases/latest) — no Python required.
+[Releases page](https://github.com/tahaenasraoui-debug/Open-source-book-downloader/releases/latest) — no Python required.
 
 ## Screenshot
 
-
-
-
 ![screenshot](docs/screenshot.png)
-
 
 ## Running from source
 

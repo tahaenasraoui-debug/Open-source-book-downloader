@@ -33,11 +33,19 @@ USAGE:
     Download Selected.
 """
 
+import contextlib
 import os
 import re
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
+from urllib.parse import quote
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except ImportError:  # pragma: no cover - allows headless unit tests without python3-tk
+    tk = None
+    ttk = None
+    messagebox = None
 
 import requests
 
@@ -58,11 +66,60 @@ SESSION.headers.update(HEADERS)
 
 # Preference order when a book has more than one downloadable format.
 FORMAT_PRIORITY = ["EPUB", "PDF", "TXT", "MOBI"]
+FORMAT_EXTENSIONS = {
+    "EPUB": "epub",
+    "PDF": "pdf",
+    "TXT": "txt",
+    "MOBI": "mobi",
+}
 
 
-def sanitize_filename(name: str) -> str:
-    name = re.sub(r"[^\w\s\-\.]", "", name)
-    return re.sub(r"\s+", "_", name).strip("_")[:100]
+def sanitize_filename(name: str, max_len: int = 100, fallback: str = "untitled") -> str:
+    """Convert arbitrary text into a safe, bounded filename component."""
+    cleaned = re.sub(r"[\\/]+", " ", str(name or ""))
+    cleaned = re.sub(r"[^\w\s\-.]", "", cleaned)
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)
+    cleaned = re.sub(r"[\s_]+", "_", cleaned).strip("_.")
+    if max_len > 0:
+        cleaned = cleaned[:max_len].strip("_.")
+    return cleaned or fallback
+
+
+def build_dest_path(result: dict, ext: str, download_dir: str = DOWNLOAD_DIR) -> str:
+    """Build a collision-safe output path including author, ID, and dedup suffix."""
+    safe_ext = sanitize_filename(ext, max_len=16, fallback="bin").lstrip(".") or "bin"
+    parts = [
+        sanitize_filename(result.get("source", ""), max_len=25, fallback="source"),
+        sanitize_filename(result.get("title", ""), max_len=80, fallback="untitled"),
+    ]
+    author = str(result.get("author") or "").strip()
+    if author:
+        parts.append(sanitize_filename(author, max_len=40, fallback="unknown"))
+    book_id = str(result.get("id") or "").strip()
+    if book_id:
+        parts.append(sanitize_filename(book_id, max_len=30, fallback="id"))
+
+    stem = "_".join(parts)
+    candidate = os.path.join(download_dir, f"{stem}.{safe_ext}")
+    counter = 2
+    while os.path.exists(candidate) or os.path.exists(f"{candidate}.part"):
+        candidate = os.path.join(download_dir, f"{stem}_{counter}.{safe_ext}")
+        counter += 1
+    return candidate
+
+
+def _format_rate_limit_log(source_name: str, resp) -> str:
+    """Format a concise HTTP 429 log line without exposing full query URLs."""
+    retry_after = ""
+    headers = getattr(resp, "headers", None)
+    if headers:
+        raw_retry = headers.get("Retry-After")
+        if raw_retry:
+            retry_after = f" (Retry-After: {raw_retry})"
+    return (
+        f"  [!] {source_name} rate limit reached (HTTP 429){retry_after}. "
+        "Try again later."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +143,8 @@ def search_gutenberg(title, log_fn=None):
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json().get("results", [])
-    except requests.exceptions.RequestException as exc:
+        data = resp.json().get("results") or []
+    except (requests.exceptions.RequestException, ValueError) as exc:
         if log_fn:
             log_fn(f"  [!] Gutenberg error for '{title}': {exc}")
         return results
@@ -102,9 +159,13 @@ def search_gutenberg(title, log_fn=None):
                     break
         if not formats:
             continue
-        authors = ", ".join(a["name"] for a in book.get("authors", [])) or "Unknown"
+        authors = ", ".join(
+            a["name"] for a in (book.get("authors") or []) if a.get("name")
+        ) or "Unknown"
+        book_id = book.get("id")
         results.append({
             "source": "Gutenberg",
+            "id": str(book_id) if book_id is not None else "",
             "title": book.get("title", title),
             "author": authors,
             "formats": formats,
@@ -125,8 +186,8 @@ def search_openlibrary(title, log_fn=None):
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        docs = resp.json().get("docs", [])
-    except requests.exceptions.RequestException as exc:
+        docs = resp.json().get("docs") or []
+    except (requests.exceptions.RequestException, ValueError) as exc:
         if log_fn:
             log_fn(f"  [!] Open Library error for '{title}': {exc}")
         return results
@@ -146,9 +207,10 @@ def search_openlibrary(title, log_fn=None):
         if not formats:
             continue  # borrow-only or no usable files - skip, no DRM bypass
 
-        authors = ", ".join(doc.get("author_name", [])) or "Unknown"
+        authors = ", ".join(doc.get("author_name") or []) or "Unknown"
         results.append({
             "source": "Open Library",
+            "id": str(ia_id),
             "title": doc.get("title", title),
             "author": authors,
             "formats": formats,
@@ -162,31 +224,33 @@ def fetch_archive_org_formats(ia_id, log_fn=None):
     access-restricted (borrow-only / DRM) - we never attempt to work around
     that. Otherwise returns a dict of label -> direct download URL.
     """
+    encoded_id = quote(str(ia_id), safe="")
     try:
         resp = SESSION.get(
-            f"https://archive.org/metadata/{ia_id}",
+            f"https://archive.org/metadata/{encoded_id}",
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         meta = resp.json()
-    except requests.exceptions.RequestException as exc:
+    except (requests.exceptions.RequestException, ValueError) as exc:
         if log_fn:
             log_fn(f"  [!] Internet Archive error for '{ia_id}': {exc}")
         return {}
 
-    if meta.get("metadata", {}).get("access-restricted-item") in ("true", True):
+    if (meta.get("metadata") or {}).get("access-restricted-item") in ("true", True):
         return {}  # borrow-only item; skip entirely
 
     formats = {}
-    for f in meta.get("files", []):
+    for f in meta.get("files") or []:
         fmt = (f.get("format") or "").upper()
         name = f.get("name", "")
         if not name:
             continue
-        url = f"https://archive.org/download/{ia_id}/{name}"
+        encoded_name = quote(name.lstrip("/"), safe="/")
+        url = f"https://archive.org/download/{encoded_id}/{encoded_name}"
         if "EPUB" in fmt and "EPUB" not in formats:
             formats["EPUB"] = url
-        elif fmt == "TEXT PDF" or fmt == "PDF" or ("PDF" in fmt and "PDF" not in formats):
+        elif fmt in ("TEXT PDF", "PDF") or ("PDF" in fmt and "PDF" not in formats):
             formats.setdefault("PDF", url)
         elif "DJVUTXT" in fmt.replace(" ", "") and "TXT" not in formats:
             formats["TXT"] = url
@@ -197,7 +261,7 @@ def fetch_archive_org_formats(ia_id, log_fn=None):
 # Source: Google Books (public-domain, directly downloadable items only)
 # ---------------------------------------------------------------------------
 
-def search_google_books(title, log_fn=None):
+def search_google_books(title, log_fn=None, on_rate_limit=None):
     results = []
     try:
         resp = SESSION.get(
@@ -205,9 +269,25 @@ def search_google_books(title, log_fn=None):
             params={"q": title, "maxResults": 5},
             timeout=REQUEST_TIMEOUT,
         )
+        if resp.status_code == 429:
+            if log_fn:
+                log_fn(_format_rate_limit_log("Google Books", resp))
+            if on_rate_limit:
+                on_rate_limit()
+            return results
         resp.raise_for_status()
-        items = resp.json().get("items", [])
-    except requests.exceptions.RequestException as exc:
+        items = resp.json().get("items") or []
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 429:
+            if log_fn:
+                log_fn(_format_rate_limit_log("Google Books", exc.response))
+            if on_rate_limit:
+                on_rate_limit()
+            return results
+        if log_fn:
+            log_fn(f"  [!] Google Books error for '{title}': {exc}")
+        return results
+    except (requests.exceptions.RequestException, ValueError) as exc:
         if log_fn:
             log_fn(f"  [!] Google Books error for '{title}': {exc}")
         return results
@@ -230,9 +310,10 @@ def search_google_books(title, log_fn=None):
         if not formats:
             continue  # public domain but no direct download link exposed
 
-        authors = ", ".join(info.get("authors", [])) or "Unknown"
+        authors = ", ".join(info.get("authors") or []) or "Unknown"
         results.append({
             "source": "Google Books",
+            "id": str(item.get("id") or ""),
             "title": info.get("title", title),
             "author": authors,
             "formats": formats,
@@ -243,11 +324,18 @@ def search_google_books(title, log_fn=None):
 SOURCES = [search_gutenberg, search_openlibrary, search_google_books]
 
 
-def search_all_sources(title, log_fn):
+def search_all_sources(title, log_fn, on_rate_limit=None, skip_sources=None):
     all_results = []
     for source_fn in SOURCES:
+        if skip_sources and (
+            source_fn in skip_sources or getattr(source_fn, "__name__", "") in skip_sources
+        ):
+            continue
         try:
-            found = source_fn(title, log_fn=log_fn)
+            if getattr(source_fn, "__name__", "") == "search_google_books":
+                found = source_fn(title, log_fn=log_fn, on_rate_limit=on_rate_limit)
+            else:
+                found = source_fn(title, log_fn=log_fn)
             all_results.extend(found)
         except Exception as exc:  # defensive: one bad source shouldn't kill the search
             log_fn(f"  [!] {source_fn.__name__} unexpected error for '{title}': {exc}")
@@ -258,22 +346,49 @@ def search_all_sources(title, log_fn):
 # Download helper
 # ---------------------------------------------------------------------------
 
-def download_file(url, dest_path, progress_cb):
+def _parse_content_length(raw_value) -> int:
+    try:
+        total = int(raw_value) if raw_value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+    return max(0, total)
+
+
+def _remove_if_exists(path: str) -> None:
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
+def download_file(url, dest_path, progress_cb=None):
+    """Stream *url* into a `.part` temporary file and rename atomically on completion."""
+    part_path = f"{dest_path}.part"
+    created_part = False
     try:
         with SESSION.get(url, stream=True, timeout=REQUEST_TIMEOUT) as resp:
             resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
+            total = _parse_content_length(resp.headers.get("content-length"))
             downloaded = 0
-            with open(dest_path, "wb") as f:
+            if progress_cb:
+                progress_cb(0, total)
+            created_part = True
+            with open(part_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     if not chunk:
                         continue
                     f.write(chunk)
                     downloaded += len(chunk)
-                    progress_cb(downloaded, total)
+                    if progress_cb:
+                        progress_cb(downloaded, total)
+        os.replace(part_path, dest_path)
         return True, None
-    except requests.exceptions.RequestException as exc:
+    except (requests.exceptions.RequestException, OSError) as exc:
+        if created_part:
+            _remove_if_exists(part_path)
         return False, str(exc)
+    except Exception:
+        if created_part:
+            _remove_if_exists(part_path)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -300,24 +415,29 @@ class BookDownloaderApp:
 
         # Maps Treeview row id -> result dict (with 'formats')
         self.row_data = {}
+        self._searching = False
+        self._downloading = False
+        self._indeterminate_active = False
 
         self._build_widgets()
 
     def _setup_style(self):
         style = ttk.Style(self.root)
         # 'clam' is the most theme-able built-in ttk theme across platforms
-        try:
+        with contextlib.suppress(tk.TclError):
             style.theme_use("clam")
-        except tk.TclError:
-            pass
 
         default_font = ("Segoe UI", 10)
         heading_font = ("Segoe UI", 13, "bold")
         subtle_font = ("Segoe UI", 9)
 
         style.configure(".", font=default_font, background=self.BG)
-        style.configure("Header.TLabel", font=heading_font, background=self.BG, foreground=self.TEXT)
-        style.configure("Subtle.TLabel", font=subtle_font, background=self.BG, foreground=self.MUTED)
+        style.configure(
+            "Header.TLabel", font=heading_font, background=self.BG, foreground=self.TEXT
+        )
+        style.configure(
+            "Subtle.TLabel", font=subtle_font, background=self.BG, foreground=self.MUTED
+        )
         style.configure("TFrame", background=self.BG)
         style.configure("Card.TFrame", background=self.PANEL_BG)
 
@@ -412,7 +532,10 @@ class BookDownloaderApp:
         action_bar.grid(row=3, column=0, sticky="ew", pady=(12, 8))
 
         self.download_btn = ttk.Button(
-            action_bar, text="Download Selected", style="Accent.TButton", command=self.start_download
+            action_bar,
+            text="Download Selected",
+            style="Accent.TButton",
+            command=self.start_download,
         )
         self.download_btn.pack(side="left")
 
@@ -461,33 +584,84 @@ class BookDownloaderApp:
         self.root.after(0, _append)
 
     def set_status(self, text):
-        self.root.after(0, lambda: self.status_var.set(text))
+        self.root.after(0, self.status_var.set, text)
+
+    def _reset_progress(self):
+        self._indeterminate_active = False
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+
+    def _start_progress_indeterminate(self):
+        if not self._indeterminate_active:
+            self._indeterminate_active = True
+            self.progress.configure(mode="indeterminate")
+            self.progress.start()
+
+    def _set_progress_determinate(self, pct):
+        if self._indeterminate_active:
+            self._indeterminate_active = False
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+        self.progress.configure(value=pct)
 
     # -- search --------------------------------------------------------
     def start_search(self):
+        if self._searching or self._downloading:
+            return
         raw = self.query_var.get().strip()
         if not raw or raw == self._placeholder:
             messagebox.showinfo("No input", "Enter at least one book title.")
             return
         titles = [t.strip() for t in raw.split(",") if t.strip()]
+        if not titles:
+            messagebox.showinfo("No input", "Enter at least one book title.")
+            return
 
+        self._searching = True
         self.tree.delete(*self.tree.get_children())
         self.row_data.clear()
         self.search_btn.configure(state="disabled")
+        self.download_btn.configure(state="disabled")
         self.set_status("Searching...")
 
         threading.Thread(target=self._search_worker, args=(titles,), daemon=True).start()
 
     def _search_worker(self, titles):
-        for title in titles:
-            self.log(f"Searching for: {title}")
-            results = search_all_sources(title, self.log)
-            if not results:
-                self.log(f"  No freely downloadable matches found for '{title}'.")
-            for r in results:
-                self.root.after(0, self._add_row, r)
-        self.set_status("Search complete.")
-        self.root.after(0, lambda: self.search_btn.configure(state="normal"))
+        google_rate_limited = False
+        try:
+            skip_sources = set()
+
+            def on_rate_limit():
+                nonlocal google_rate_limited
+                google_rate_limited = True
+                skip_sources.add(search_google_books)
+                self.set_status("Searching... (Google Books rate-limited: HTTP 429)")
+
+            for title in titles:
+                self.log(f"Searching for: {title}")
+                results = search_all_sources(
+                    title,
+                    self.log,
+                    on_rate_limit=on_rate_limit,
+                    skip_sources=skip_sources,
+                )
+                if not results:
+                    self.log(f"  No freely downloadable matches found for '{title}'.")
+                for r in results:
+                    self.root.after(0, self._add_row, r)
+        finally:
+            status = (
+                "Search complete (Google Books rate-limited: HTTP 429 — try again later)."
+                if google_rate_limited
+                else "Search complete."
+            )
+            self.root.after(0, self._finish_search, status)
+
+    def _finish_search(self, status_text):
+        self._searching = False
+        self.status_var.set(status_text)
+        self.search_btn.configure(state="normal")
+        self.download_btn.configure(state="normal")
 
     def _add_row(self, result):
         fmt_labels = ", ".join(result["formats"].keys())
@@ -502,50 +676,67 @@ class BookDownloaderApp:
 
     # -- download --------------------------------------------------------
     def start_download(self):
+        if self._searching or self._downloading:
+            return
         selected = self.tree.selection()
         if not selected:
             messagebox.showinfo("Nothing selected", "Select one or more rows to download.")
             return
+        self._downloading = True
         self.download_btn.configure(state="disabled")
+        self.search_btn.configure(state="disabled")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         threading.Thread(target=self._download_worker, args=(selected,), daemon=True).start()
 
     def _download_worker(self, row_ids):
         downloaded, failed = 0, 0
-        for row_id in row_ids:
-            result = self.row_data.get(row_id)
-            if not result:
-                continue
-            label, url = self._pick_format(result["formats"])
-            ext = {"EPUB": "epub", "PDF": "pdf", "TXT": "txt", "MOBI": "mobi"}.get(label, "bin")
-            filename = f"{sanitize_filename(result['source'])}_{sanitize_filename(result['title'])}.{ext}"
-            dest_path = os.path.join(DOWNLOAD_DIR, filename)
+        try:
+            for row_id in row_ids:
+                result = self.row_data.get(row_id)
+                if not result:
+                    continue
+                label, url = self._pick_format(result["formats"])
+                ext = FORMAT_EXTENSIONS.get(label, "bin")
+                dest_path = build_dest_path(result, ext, download_dir=DOWNLOAD_DIR)
 
-            self.set_status(f"Downloading {result['title']} ({label})...")
-            self.log(f"Downloading: {result['title']} [{result['source']}, {label}]")
+                self.set_status(f"Downloading {result['title']} ({label})...")
+                self.log(f"Downloading: {result['title']} [{result['source']}, {label}]")
 
-            def progress_cb(downloaded_bytes, total_bytes):
-                if total_bytes:
-                    pct = downloaded_bytes * 100 // total_bytes
-                    self.root.after(0, lambda: self.progress.configure(value=pct))
+                last_pct = -1
+                indeterminate_sent = False
+
+                def progress_cb(downloaded_bytes, total_bytes):
+                    nonlocal last_pct, indeterminate_sent
+                    if total_bytes > 0:
+                        pct = min(100, downloaded_bytes * 100 // total_bytes)
+                        if pct != last_pct:
+                            last_pct = pct
+                            self.root.after(0, self._set_progress_determinate, pct)
+                    elif not indeterminate_sent:
+                        indeterminate_sent = True
+                        self.root.after(0, self._start_progress_indeterminate)
+
+                self.root.after(0, self._reset_progress)
+                ok, err = download_file(url, dest_path, progress_cb)
+                self.root.after(0, self._reset_progress)
+                if ok:
+                    downloaded += 1
+                    self.log(f"  [OK] Saved to {dest_path}")
                 else:
-                    self.root.after(0, lambda: self.progress.configure(mode="indeterminate"))
+                    failed += 1
+                    self.log(f"  [!] Failed: {err}")
+        finally:
+            self.root.after(0, self._finish_download, downloaded, failed)
 
-            self.root.after(0, lambda: self.progress.configure(mode="determinate", value=0))
-            ok, err = download_file(url, dest_path, progress_cb)
-            if ok:
-                downloaded += 1
-                self.log(f"  [OK] Saved to {dest_path}")
-            else:
-                failed += 1
-                self.log(f"  [!] Failed: {err}")
-
-        self.root.after(0, lambda: self.progress.configure(value=0))
-        self.set_status(f"Done. Downloaded {downloaded}, failed {failed}.")
-        self.root.after(0, lambda: self.download_btn.configure(state="normal"))
-        self.root.after(0, lambda: messagebox.showinfo(
+    def _finish_download(self, downloaded, failed):
+        self._reset_progress()
+        self._downloading = False
+        self.status_var.set(f"Done. Downloaded {downloaded}, failed {failed}.")
+        self.download_btn.configure(state="normal")
+        self.search_btn.configure(state="normal")
+        messagebox.showinfo(
             "Download summary", f"Downloaded: {downloaded}\nFailed: {failed}"
-        ))
+        )
 
     @staticmethod
     def _pick_format(formats):
@@ -558,8 +749,12 @@ class BookDownloaderApp:
 
 
 def main():
+    if tk is None:
+        raise RuntimeError(
+            "tkinter is not installed. Install python3-tk (e.g. `sudo apt install python3-tk`)."
+        )
     root = tk.Tk()
-    app = BookDownloaderApp(root)
+    BookDownloaderApp(root)
     root.mainloop()
 
 
