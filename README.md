@@ -51,12 +51,11 @@ sudo pacman -S tk
 
 ## Usage
 
-1. Type one or more book titles into the search box, comma-separated.
-2. Click **Search**. Results from all three sources appear in the table.
-3. Select the rows you want (click-drag or Ctrl/Shift-click for multiple).
-4. Click **Download Selected**. Files are saved into the `downloads/`
-   folder, preferring EPUB > PDF > TXT > MOBI when more than one format
-   is available.
+1. Toggle which sources to query (**Gutenberg**, **Open Library**, **Google Books**) in the top-right bar.
+2. Type one or more book titles into the search box (comma-separated) and click **Search** (or press `Enter`).
+3. Click any column header to sort results by **Source**, **Title**, **Author**, **Year**, **Lang**, or **Formats**.
+4. Choose your preferred format (`Auto`, `EPUB`, `PDF`, `TXT`, or `MOBI`) and destination folder (defaults to `~/Downloads/FreeBookDownloader`).
+5. Select rows (`Ctrl+A` selects all; right-click or double-click opens the book's web page) and click **Download Selected** (or **Cancel** anytime). Click **Open Folder** to view saved files.
 
 ## Building the .exe yourself
 

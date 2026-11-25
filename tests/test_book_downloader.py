@@ -1,8 +1,12 @@
+import threading
 from unittest.mock import MagicMock
 
 import pytest
 import requests
 
+import book_downloader.downloader as dl_mod
+import book_downloader.sources as src_mod
+import book_downloader.ui as ui_mod
 import book_downloader_gui as app_mod
 
 
@@ -65,6 +69,26 @@ class _FakeTree:
 
     def selection(self):
         return self._selected
+
+    def selection_set(self, items):
+        self._selected = tuple(items)
+
+    def item(self, row_id, option=None, **kwargs):
+        if kwargs:
+            self.rows[row_id].update(kwargs)
+            return None
+        if option == "values":
+            return self.rows[row_id]["values"]
+        return self.rows[row_id]
+
+    def move(self, row_id, _parent, index):
+        items = list(self.rows.items())
+        items = [pair for pair in items if pair[0] != row_id]
+        items.insert(index, (row_id, self.rows[row_id]))
+        self.rows = dict(items)
+
+    def heading(self, _col, **_kwargs):
+        pass
 
 
 class _FakeText(_FakeWidget):
@@ -304,7 +328,7 @@ def test_download_file_cleans_part_on_replace_oserror(tmp_path, monkeypatch):
     ctx = _mock_stream_response([b"data"], headers={"content-length": "4"})
     monkeypatch.setattr(app_mod.SESSION, "get", MagicMock(return_value=ctx))
     monkeypatch.setattr(
-        app_mod.os,
+        dl_mod.os,
         "replace",
         MagicMock(side_effect=OSError("permission denied")),
     )
@@ -407,8 +431,8 @@ def test_headless_search_worker_reports_google_429_in_status_and_skips_repeat(mo
         return []
 
     fake_google.__name__ = "search_google_books"
-    monkeypatch.setattr(app_mod, "search_google_books", fake_google)
-    monkeypatch.setattr(app_mod, "SOURCES", [fake_gutenberg, fake_openlibrary, fake_google])
+    monkeypatch.setattr(src_mod, "search_google_books", fake_google)
+    monkeypatch.setattr(src_mod, "SOURCES", [fake_gutenberg, fake_openlibrary, fake_google])
 
     app._searching = True
     app._search_worker(["metamorphosis", "moby dick"])
@@ -435,12 +459,12 @@ def test_start_search_blocks_reentrant_trigger(monkeypatch, flag_name):
 
     thread_started = []
     monkeypatch.setattr(
-        app_mod.threading,
+        ui_mod.threading,
         "Thread",
         lambda *args, **kwargs: thread_started.append((args, kwargs)),
     )
     msg_mock = MagicMock()
-    monkeypatch.setattr(app_mod, "messagebox", msg_mock)
+    monkeypatch.setattr(ui_mod, "messagebox", msg_mock)
 
     app.start_search()
 
@@ -464,9 +488,9 @@ def _add_dummy_book_row(app):
 
 def test_download_worker_indeterminate_progress_starts_and_stops(tmp_path, monkeypatch):
     app = _make_headless_app()
-    monkeypatch.setattr(app_mod, "DOWNLOAD_DIR", str(tmp_path))
+    app.download_dir_var = _FakeVar(str(tmp_path))
     msg_mock = MagicMock()
-    monkeypatch.setattr(app_mod, "messagebox", msg_mock)
+    monkeypatch.setattr(ui_mod, "messagebox", msg_mock)
     row_id = _add_dummy_book_row(app)
 
     ctx = _mock_stream_response([b"chunk1", b"chunk2"], headers={})
@@ -486,9 +510,9 @@ def test_download_worker_indeterminate_progress_starts_and_stops(tmp_path, monke
 
 def test_download_worker_indeterminate_stops_on_failure(tmp_path, monkeypatch):
     app = _make_headless_app()
-    monkeypatch.setattr(app_mod, "DOWNLOAD_DIR", str(tmp_path))
+    app.download_dir_var = _FakeVar(str(tmp_path))
     msg_mock = MagicMock()
-    monkeypatch.setattr(app_mod, "messagebox", msg_mock)
+    monkeypatch.setattr(ui_mod, "messagebox", msg_mock)
     row_id = _add_dummy_book_row(app)
 
     ctx = _mock_stream_response(
@@ -513,9 +537,9 @@ def test_download_worker_indeterminate_stops_on_failure(tmp_path, monkeypatch):
 
 def test_download_worker_determinate_progress_clamps_and_resets(tmp_path, monkeypatch):
     app = _make_headless_app()
-    monkeypatch.setattr(app_mod, "DOWNLOAD_DIR", str(tmp_path))
+    app.download_dir_var = _FakeVar(str(tmp_path))
     msg_mock = MagicMock()
-    monkeypatch.setattr(app_mod, "messagebox", msg_mock)
+    monkeypatch.setattr(ui_mod, "messagebox", msg_mock)
     row_id = _add_dummy_book_row(app)
 
     observed_values = []
@@ -551,7 +575,7 @@ def test_start_search_rejects_empty_placeholder_and_comma_only_input(monkeypatch
     app = _make_headless_app()
     app.query_var.set(raw_query)
     msg_mock = MagicMock()
-    monkeypatch.setattr(app_mod, "messagebox", msg_mock)
+    monkeypatch.setattr(ui_mod, "messagebox", msg_mock)
 
     app.start_search()
 
@@ -600,3 +624,131 @@ def test_search_gutenberg_and_openlibrary_include_book_ids(monkeypatch):
     assert ol_results[0]["formats"]["EPUB"] == (
         "https://archive.org/download/mobydick_ia_01/Moby%20Dick.epub"
     )
+
+
+# ---------------------------------------------------------------------------
+# New feature tests: format preference, cancel, sorting, metadata, CLI
+# ---------------------------------------------------------------------------
+
+def test_default_download_dir_uses_home_downloads(tmp_path, monkeypatch):
+    monkeypatch.setattr(dl_mod.Path, "home", lambda: tmp_path)
+    (tmp_path / "Downloads").mkdir()
+    assert dl_mod.default_download_dir() == str(tmp_path / "Downloads" / "FreeBookDownloader")
+
+
+def test_pick_format_respects_preference_with_fallback():
+    formats = {"EPUB": "u1", "PDF": "u2", "TXT": "u3"}
+    assert app_mod.pick_format(formats, "Auto") == ("EPUB", "u1")
+    assert app_mod.pick_format(formats, "PDF") == ("PDF", "u2")
+    assert app_mod.pick_format(formats, "MOBI") == ("EPUB", "u1")
+
+
+def test_download_file_cancels_cleanly_and_removes_part(tmp_path, monkeypatch):
+    dest = tmp_path / "cancel.pdf"
+    cancel_ev = threading.Event()
+
+    def chunk_gen():
+        yield b"chunk1"
+        cancel_ev.set()
+        yield b"chunk2"
+
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.headers = {"content-length": "12"}
+    resp.iter_content.return_value = chunk_gen()
+    ctx = MagicMock()
+    ctx.__enter__.return_value = resp
+    ctx.__exit__.return_value = False
+    monkeypatch.setattr(app_mod.SESSION, "get", MagicMock(return_value=ctx))
+
+    ok, err = app_mod.download_file(
+        "https://example.org/cancel.pdf", str(dest), cancel_event=cancel_ev
+    )
+    assert ok is False
+    assert "Cancelled" in err
+    assert not dest.exists()
+    assert not (tmp_path / "cancel.pdf.part").exists()
+
+
+def test_search_openlibrary_skips_borrow_only_before_ia_call(monkeypatch):
+    ol_resp = MagicMock()
+    ol_resp.raise_for_status.return_value = None
+    ol_resp.json.return_value = {
+        "docs": [
+            {
+                "title": "Restricted",
+                "ia": ["restricted_ia"],
+                "ebook_access": "borrowable",
+            },
+            {
+                "title": "Public Book",
+                "author_name": ["Jane Doe"],
+                "ia": ["public_ia"],
+                "ebook_access": "public",
+                "first_publish_year": 1899,
+                "language": ["eng"],
+                "key": "/works/OL1W",
+            },
+        ]
+    }
+    ia_calls = []
+
+    def fake_ia(ia_id, log_fn=None):
+        ia_calls.append(ia_id)
+        return {"EPUB": f"https://archive.org/download/{ia_id}/book.epub"}
+
+    monkeypatch.setattr(src_mod.SESSION, "get", MagicMock(return_value=ol_resp))
+    monkeypatch.setattr(src_mod, "fetch_archive_org_formats", fake_ia)
+
+    results = src_mod.search_openlibrary("test")
+    assert ia_calls == ["public_ia"]
+    assert len(results) == 1
+    assert results[0]["year"] == "1899"
+    assert results[0]["language"] == "ENG"
+    assert results[0]["info_url"] == "https://openlibrary.org/works/OL1W"
+
+
+def test_headless_sort_select_all_and_cancel():
+    app = _make_headless_app()
+    app._sort_state = (None, False)
+    app.count_var = _FakeVar("")
+    app.cancel_btn = _FakeWidget()
+    app._cancel_event = threading.Event()
+    app._add_row(
+        {
+            "source": "Gutenberg",
+            "title": "Zebra",
+            "author": "A",
+            "year": "1920",
+            "language": "EN",
+            "formats": {"EPUB": "u1"},
+        }
+    )
+    app._add_row(
+        {
+            "source": "Open Library",
+            "title": "Alpha",
+            "author": "B",
+            "year": "1890",
+            "language": "FR",
+            "formats": {"PDF": "u2"},
+        }
+    )
+
+    app._sort_by_column("title")
+    ordered_titles = [app.tree.item(r, "values")[1] for r in app.tree.get_children()]
+    assert ordered_titles == ["Alpha", "Zebra"]
+
+    app._select_all_rows()
+    assert len(app.tree.selection()) == 2
+    assert app.count_var.get() == "2 results · 2 selected"
+
+    app._searching = True
+    app.cancel_active()
+    assert app._cancel_event.is_set() is True
+
+
+def test_cli_version_exits_zero():
+    with pytest.raises(SystemExit) as exc:
+        app_mod.main(["--version"])
+    assert exc.value.code == 0
