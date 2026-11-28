@@ -66,6 +66,25 @@ pyinstaller --onefile --windowed --name BookDownloader book_downloader_gui.py
 
 The executable will be in `dist/BookDownloader.exe`.
 
+## Contributing
+
+Contributions, bug reports, and feature suggestions are welcome. For larger changes or new features, please open an issue first to discuss the approach before writing code.
+
+1. Fork the repository and create a branch from `main` (e.g., `git checkout -b fix/short-description` or `feat/short-description`).
+2. Keep pull requests focused on a single change and follow the existing code style.
+3. Run the local checks before opening a PR:
+
+   ```bash
+   ruff check .
+   pytest
+   ```
+
+4. Open a Pull Request describing what changed and why (include a screenshot for UI changes, and link any related issue).
+
+Only add or integrate legal public-domain and open-access sources (no shadow libraries or DRM bypass).
+
+When reporting bugs, please include steps to reproduce, expected vs. actual behavior, and your environment details (OS and Python version).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
